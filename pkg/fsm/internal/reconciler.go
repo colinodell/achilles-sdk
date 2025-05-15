@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/DataDog/dd-trace-go/v2/ddtrace/tracer"
 	"go.uber.org/zap"
 	"golang.org/x/exp/slices"
 	corev1 "k8s.io/api/core/v1"
@@ -84,6 +85,11 @@ func NewFSMReconciler[T any, Obj apitypes.FSMResource[T]](
 }
 
 func (r *fsmReconciler[T, Obj]) Reconcile(ctx context.Context, req ctrl.Request) (res ctrl.Result, err error) {
+	span, ctx := tracer.StartSpanFromContext(ctx, "reconcile-"+r.name)
+	span.SetTag("name", req.Name)
+	span.SetTag("namespace", req.Namespace)
+	defer span.Finish()
+
 	requestId := ctrlcontroller.ReconcileIDFromContext(ctx)
 	log := r.log.With("request", req, "requestId", requestId)
 	log.Debug("entering reconcile")
@@ -166,6 +172,11 @@ func (r *fsmReconciler[T, Obj]) reconcile(
 	req ctrl.Request,
 	log *zap.SugaredLogger,
 ) (Obj, api.Conditioned, types.Result) {
+	span, ctx := tracer.StartSpanFromContext(ctx, "reconcile-"+r.name+"-inner")
+	span.SetTag("name", req.Name)
+	span.SetTag("namespace", req.Namespace)
+	defer span.Finish()
+
 	obj := Obj(new(T))
 	if err := r.client.Get(ctx, req.NamespacedName, obj); k8serrors.IsNotFound(err) {
 		// object not found, meaning that it has been deleted (not merely in terminating state)
@@ -237,11 +248,18 @@ func (r *fsmReconciler[T, Obj]) reconcile(
 	var requeueAfterCompletion types.Result
 
 	for currentState != nil {
+		stateSpan, ctx := tracer.StartSpanFromContext(ctx, currentState.Name)
+		stateSpan.SetTag("name", req.Name)
+		stateSpan.SetTag("namespace", req.Namespace)
+
 		log.Debugw("entering state", "state", currentState.Name)
 		// record seen states to prevent loops
 		if seenStates.Has(currentState.Name) {
+			stateSpan.SetTag("seen", true)
+			stateSpan.Finish()
 			return obj, conditions, types.ErrorResult(fmt.Errorf("%w %q", errStateLoop, currentState.Name))
 		}
+		stateSpan.SetTag("seen", false)
 		seenStates.Insert(currentState.Name)
 
 		// initialize output set scoped to the current state
@@ -253,6 +271,7 @@ func (r *fsmReconciler[T, Obj]) reconcile(
 		var next *types.State[Obj]
 
 		var result types.Result
+		stateSpan.SetTag("transition", currentState.Transition != nil)
 		if currentState.Transition != nil {
 			// obj, managedResources, and out can be mutated
 
@@ -264,6 +283,8 @@ func (r *fsmReconciler[T, Obj]) reconcile(
 
 			condition.LastTransitionTime = metav1.Now() // set status condition last transition time
 			condition.Status = corev1.ConditionTrue     // default status condition to true if state is done
+
+			stateSpan.SetTag("done", result.IsDone())
 
 			if result.RequeueAfterCompletion {
 				// the last Result type with RequeueAfterCompletion==true takes precedence
@@ -281,6 +302,7 @@ func (r *fsmReconciler[T, Obj]) reconcile(
 					condition.Message, condition.Reason = result.GetMessageAndReason()
 					conditions.SetConditions(condition)
 				}
+				stateSpan.Finish()
 				return obj, conditions, result.WrapError(fmt.Sprintf("transitioning state %q", currentState.Name))
 			} else if result.CustomStatusCondition != nil {
 				condition.Status = result.CustomStatusCondition.Status
@@ -297,6 +319,7 @@ func (r *fsmReconciler[T, Obj]) reconcile(
 				condition.Message = fmt.Sprintf("Failed to apply outputs: %v", err)
 				conditions.SetConditions(condition)
 			}
+			stateSpan.Finish()
 			return obj, conditions, types.ErrorResult(fmt.Errorf("applying outputs: %w", err))
 		}
 
@@ -306,12 +329,15 @@ func (r *fsmReconciler[T, Obj]) reconcile(
 		}
 
 		// for requeue results (excluding requeues after completion), requeue instead of proceeding to the following state
+		stateSpan.SetTag("requeue", result.HasRequeue())
 		if result.HasRequeue() && !result.RequeueAfterCompletion {
+			stateSpan.Finish()
 			return obj, conditions, result
 		}
 
 		// update state
 		currentState = next
+		stateSpan.Finish()
 	}
 
 	result := types.DoneResult()
