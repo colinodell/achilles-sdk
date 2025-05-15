@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/DataDog/dd-trace-go/v2/ddtrace/tracer"
 	"go.uber.org/zap"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -27,6 +28,9 @@ func ApplyOutputSet[T any, Obj apitypes.FSMResource[T]](
 	obj Obj,
 	out *types.OutputSet,
 ) error {
+	span, ctx := tracer.StartSpanFromContext(ctx, "apply-output-set")
+	defer span.Finish()
+
 	// delete resources
 	for _, o := range out.ListDeleted() {
 		if err := c.Delete(ctx, o); err != nil && !k8serrors.IsNotFound(err) {
